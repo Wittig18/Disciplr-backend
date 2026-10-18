@@ -20,7 +20,7 @@ module.exports = {
     ],
   },
   setupFiles: ["<rootDir>/jest.setup.cjs"],
-  testMatch: ["**/tests/**/*.test.ts", "**/src/**/*.test.ts"],
+  testMatch: ["**/tests/**/*.test.ts", "**/src/**/*.test.ts", "<rootDir>/api/__tests__/**/*.test.mjs", "<rootDir>/apilib/__tests__/**/*.test.mjs"],
   // These suites are written against a different test runner than the one
   // `npm test` uses (Jest): most target Bun's test runner (they import
   // 'bun:test' and/or call the ambient `mock.module()` API that Bun injects

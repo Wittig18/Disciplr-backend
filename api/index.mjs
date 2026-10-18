@@ -4,6 +4,7 @@ import cors from 'cors'
 import { randomBytes } from 'node:crypto'
 import { getStore } from '../apilib/store.mjs'
 import { OPENAPI } from '../apilib/openapi.mjs'
+import { OnchainError, isEnabled, getConfig, getServer, buildCreateVaultTx, buildStakeTx, verifySignedTx, txHashOf, submitAndWait, validateForChain } from '../apilib/soroban.mjs'
 
 const app = express()
 app.disable('x-powered-by')
@@ -13,7 +14,10 @@ app.use(express.json({ limit: '100kb' }))
 const STELLAR = /^G[A-Z2-7]{55}$/
 const hex = (n) => randomBytes(n).toString('hex')
 const bad = (res, msg, code = 400) => res.status(code).json({ error: msg })
-const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); res.status(500).json({ error: 'Internal error' }) })
+const wrap = (fn) => (req, res) => fn(req, res).catch((e) => {
+  if (e instanceof OnchainError) return res.status(e.status).json({ error: e.message, ...(e.contractError && { contractError: e.contractError }) })
+  console.error(e); res.status(500).json({ error: 'Internal error' })
+})
 
 const router = express.Router()
 
@@ -61,15 +65,71 @@ router.post('/vaults', wrap(async (req, res) => {
   milestones.forEach((m, i) => { m.id = `${id}-m${i + 1}`; delete m._i })
   const now = new Date().toISOString()
   const s = await getStore()
+  const chain = isEnabled()
   const vault = {
-    id, name: String(b.name || '').trim().slice(0, 200) || `Vault ${amount}`, creator: b.creator, amount: String(amount), status: 'active', startDate: start.toISOString(), endDate: end.toISOString(),
+    id, name: String(b.name || '').trim().slice(0, 200) || `Vault ${amount}`, creator: b.creator, amount: String(amount), status: chain ? 'draft' : 'active', onchainStatus: chain ? 'pending_onchain' : null, startDate: start.toISOString(), endDate: end.toISOString(),
     verifier: b.verifier, successDestination: STELLAR.test(b.successDestination || '') ? b.successDestination : b.creator,
     failureDestination: STELLAR.test(b.failureDestination || '') ? b.failureDestination : b.verifier,
     createdAt: now, updatedAt: now, milestones,
   }
+  if (chain) {
+    // Build + simulate first so an invalid vault is rejected before anything is stored.
+    const cfg = getConfig()
+    validateForChain(vault)
+    const onChain = await buildCreateVaultTx(getServer(cfg), cfg, vault)
+    await s.createVault(vault)
+    return res.status(201).json({ data: vault, onChain })
+  }
   await s.createVault(vault)
-  await s.addActivity({ id: crypto.randomUUID(), type: 'create', vaultId: id, amount: vault.amount, status: 'confirmed', hash: hex(32), memo: 'Vault created', createdAt: now })
+  await s.addActivity({ id: crypto.randomUUID(), type: 'create', vaultId: id, amount: vault.amount, status: 'simulated', hash: hex(32), memo: 'Vault created', createdAt: now })
   res.status(201).json({ data: vault })
+}))
+
+// Build the unsigned stake invocation for a vault whose create_vault is confirmed on-chain.
+router.post('/vaults/:id/onchain/stake', wrap(async (req, res) => {
+  if (!isEnabled()) return bad(res, 'On-chain mode is disabled', 409)
+  const s = await getStore()
+  const v = await s.getVault(req.params.id)
+  if (!v) return bad(res, 'Vault not found', 404)
+  if (v.onchainStatus === 'active') return bad(res, 'Vault is already active', 409)
+  if (v.onchainStatus !== 'created') return bad(res, 'Vault must be created on-chain before staking', 409)
+  const cfg = getConfig()
+  res.json({ data: v, onChain: await buildStakeTx(getServer(cfg), cfg, v) })
+}))
+
+// Accept the creator-signed XDR for create_vault or stake, verify it, relay it and record the real result.
+router.post('/vaults/:id/onchain/submit', wrap(async (req, res) => {
+  if (!isEnabled()) return bad(res, 'On-chain mode is disabled', 409)
+  const s = await getStore()
+  const v = await s.getVault(req.params.id)
+  if (!v) return bad(res, 'Vault not found', 404)
+  const cfg = getConfig()
+  const { signedXdr, networkPassphrase } = req.body || {}
+  if (typeof signedXdr !== 'string' || !signedXdr) return bad(res, 'signedXdr is required')
+  if (networkPassphrase !== undefined && networkPassphrase !== cfg.networkPassphrase) return bad(res, 'Network passphrase mismatch')
+  const operation = v.onchainStatus === 'pending_onchain' ? 'create_vault' : v.onchainStatus === 'created' ? 'stake' : null
+  // Idempotency is keyed by tx hash: a resubmission of an already-recorded transaction never broadcasts a duplicate row.
+  const probeHash = txHashOf(signedXdr, cfg)
+  let existing = probeHash ? await s.getActivityByHash(probeHash) : null
+  if (existing && existing.vaultId !== v.id) existing = null
+  if (existing && existing.status !== 'pending') return res.status(existing.status === 'failed' ? 422 : 200).json({ data: v, activity: existing })
+  if (!operation) return bad(res, 'Vault is already active', 409)
+  const { tx, hash } = verifySignedTx(signedXdr, v, operation, cfg)
+  const now = new Date().toISOString()
+  const act = existing || await s.addActivity({ id: crypto.randomUUID(), type: operation === 'stake' ? 'stake' : 'create', vaultId: v.id, amount: v.amount, status: 'pending', hash, memo: `${operation} submitted`, ledger: null, createdAt: now })
+  const r = await submitAndWait(getServer(cfg), tx, hash, { resume: !!existing, timeoutMs: Number(process.env.SOROBAN_POLL_TIMEOUT_MS) || 30000, intervalMs: Number(process.env.SOROBAN_POLL_INTERVAL_MS) || 1000 })
+  if (r.status === 'PENDING') return res.status(202).json({ data: v, activity: act })
+  act.ledger = r.ledger ?? null
+  if (r.status === 'SUCCESS') {
+    act.status = 'confirmed'; act.memo = operation === 'stake' ? 'Vault staked' : 'Vault created on-chain'
+    v.onchainStatus = operation === 'stake' ? 'active' : 'created'
+    if (operation === 'stake') v.status = 'active'
+    await s.saveActivity(act); await s.saveVault(v)
+    return res.json({ data: v, activity: act })
+  }
+  act.status = 'failed'; act.memo = `${operation} failed: ${r.error.name}${r.error.message ? ` - ${r.error.message}` : ''}`
+  await s.saveActivity(act)
+  res.status(422).json({ error: `${r.error.name}: ${r.error.message}`, data: v, activity: act })
 }))
 
 // Verifier validates a milestone. When every milestone is validated the vault completes and funds release.
@@ -84,10 +144,10 @@ router.post('/vaults/:id/milestones/:mid/validate', wrap(async (req, res) => {
   if (m.status === 'completed') return bad(res, 'Milestone already validated', 409)
   m.status = 'completed'
   const now = new Date().toISOString()
-  await s.addActivity({ id: crypto.randomUUID(), type: 'validate', vaultId: v.id, amount: m.amount, status: 'confirmed', hash: hex(32), memo: `Milestone validated: ${m.title}`, createdAt: now })
+  await s.addActivity({ id: crypto.randomUUID(), type: 'validate', vaultId: v.id, amount: m.amount, status: 'simulated', hash: hex(32), memo: `Milestone validated: ${m.title}`, createdAt: now })
   if (v.milestones.every((x) => x.status === 'completed')) {
     v.status = 'completed'
-    await s.addActivity({ id: crypto.randomUUID(), type: 'release', vaultId: v.id, amount: v.amount, status: 'confirmed', hash: hex(32), memo: 'Funds released to success destination', createdAt: new Date(Date.now() + 1).toISOString() })
+    await s.addActivity({ id: crypto.randomUUID(), type: 'release', vaultId: v.id, amount: v.amount, status: 'simulated', hash: hex(32), memo: 'Funds released to success destination', createdAt: new Date(Date.now() + 1).toISOString() })
   }
   await s.saveVault(v)
   res.json({ data: v })
@@ -102,7 +162,7 @@ router.post('/vaults/:id/fail', wrap(async (req, res) => {
   if (req.body?.verifier !== v.verifier) return bad(res, 'Only the vault verifier may fail a vault', 403)
   v.status = 'failed'
   v.milestones.forEach((m) => { if (m.status !== 'completed') m.status = 'failed' })
-  await s.addActivity({ id: crypto.randomUUID(), type: 'redirect', vaultId: v.id, amount: v.amount, status: 'confirmed', hash: hex(32), memo: 'Funds redirected to failure destination', createdAt: new Date().toISOString() })
+  await s.addActivity({ id: crypto.randomUUID(), type: 'redirect', vaultId: v.id, amount: v.amount, status: 'simulated', hash: hex(32), memo: 'Funds redirected to failure destination', createdAt: new Date().toISOString() })
   await s.saveVault(v)
   res.json({ data: v })
 }))
